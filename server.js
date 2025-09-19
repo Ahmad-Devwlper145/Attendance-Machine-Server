@@ -1,533 +1,389 @@
 /**
  * Aiface Biometric Attendance Server
- *
- * Single POST endpoint: /api
- * Handles device commands: reg, sendlog, checklive, senduser
- *
- * Data persisted into JSON files: data/devices.json, data/logs.json, data/users.json
- *
- * HTTPS support: looks for certs in ./certs/server.key and ./certs/server.crt (or .pem). If missing,
- * server will fall back to HTTP and print instructions to create self-signed certs.
- *
- * Usage:
- *  - npm init -y
- *  - npm i express cors helmet dotenv fs-extra morgan
- *  - create certs/ and data/ directories (server will create data files automatically)
- *  - node server.js
- *
- * Response format:
- *  { ret: <cmd>, result: <true|false>, cloudtime: <ISO timestamp>, ...cmd-specific fields... }
- *
- * Author: Generated for Ahmad Genius (requested)
+ * 
+ * Compatible with Aiface HTTP/HTTPS+JSON Protocol
+ * Handles device registration, attendance logs, heartbeat, and user data
+ * 
+ * Deploy on Render.com or any Node.js hosting platform
  */
 
-import express from "express";
-import fs from "fs/promises";
-import fsSync from "fs";
-import https from "https";
-import http from "http";
-import path from "path";
-import cors from "cors";
-import helmet from "helmet";
-import dotenv from "dotenv";
-import morgan from "morgan";
+const express =require("express");
+const fs =require("fs/promises");
+const fsSync =require("fs");
+const path =require("path");
+const cors =require("cors");
+const { fileURLToPath } =require('url');
 
-/* ---------------------------
-   Config & Environment
-   --------------------------- */
-dotenv.config();
-const DEFAULT_PORT = 3000;
-const PORT = parseInt(process.env.PORT, 10) || DEFAULT_PORT;
-const DATA_DIR = path.resolve(process.cwd(), "data");
-const CERT_DIR = path.resolve(process.cwd(), "certs");
-const DEVICES_FILE = path.join(DATA_DIR, "devices.json");
-const LOGS_FILE = path.join(DATA_DIR, "logs.json");
-const USERS_FILE = path.join(DATA_DIR, "users.json");
+// ES6 module compatibility
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-/* ---------------------------
-   Utilities
-   --------------------------- */
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-/**
- * Get current cloud time in ISO and epoch milliseconds
- */
-function getCloudTime() {
-  const now = new Date();
-  return { iso: now.toISOString(), epoch: now.getTime() };
-}
+// Data storage paths
+const DATA_DIR = path.join(__dirname, 'data');
+const DEVICES_FILE = path.join(DATA_DIR, 'devices.json');
+const LOGS_FILE = path.join(DATA_DIR, 'logs.json');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
 
-/**
- * Safe JSON read - returns defaultValue if file missing/corrupt
- */
-async function readJsonSafe(filePath, defaultValue) {
-  try {
-    const exists = fsSync.existsSync(filePath);
-    if (!exists) return defaultValue;
-    const raw = await fs.readFile(filePath, "utf8");
-    if (!raw) return defaultValue;
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error(`[readJsonSafe] failed reading ${filePath}:`, err);
-    return defaultValue;
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+
+// Request logging
+app.use((req, res, next) => {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${req.method} ${req.url}`);
+  
+  if (req.body) {
+    console.log('Request Body:', JSON.stringify(req.body, null, 2));
   }
+  
+  // Log response
+  const originalSend = res.send;
+  res.send = function(body) {
+    console.log(`[${timestamp}] Response:`, typeof body === 'string' ? body : JSON.stringify(body, null, 2));
+    return originalSend.call(this, body);
+  };
+  
+  next();
+});
+
+// Utility functions
+function getCurrentTime() {
+  return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
-/**
- * Write JSON atomically (write to tmp then rename)
- */
-async function writeJsonSafe(filePath, obj) {
-  const tmp = `${filePath}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(obj, null, 2), "utf8");
-  await fs.rename(tmp, filePath);
-}
-
-/**
- * Ensure data directory and files exist
- */
-async function ensureDataFiles() {
+async function ensureDataDirectory() {
   try {
     if (!fsSync.existsSync(DATA_DIR)) {
       await fs.mkdir(DATA_DIR, { recursive: true });
-      console.log(`[startup] Created data directory: ${DATA_DIR}`);
     }
-    if (!fsSync.existsSync(DEVICES_FILE)) await writeJsonSafe(DEVICES_FILE, []);
-    if (!fsSync.existsSync(LOGS_FILE)) await writeJsonSafe(LOGS_FILE, []);
-    if (!fsSync.existsSync(USERS_FILE)) await writeJsonSafe(USERS_FILE, []);
-  } catch (err) {
-    console.error("[ensureDataFiles] Error creating data files:", err);
-    throw err;
-  }
-}
-
-/**
- * Simple validation helper
- */
-function requireFields(obj, fields) {
-  const missing = [];
-  for (const f of fields) if (!(f in obj)) missing.push(f);
-  return missing;
-}
-
-/* ---------------------------
-   Logging helpers
-   --------------------------- */
-
-/**
- * Format timestamp for console logs
- */
-function nowForLog() {
-  return new Date().toISOString();
-}
-
-/**
- * Wrap res.send to capture outgoing responses for logging
- */
-function responseLoggerMiddleware(req, res, next) {
-  const oldSend = res.send;
-  res.send = function (body) {
-    try {
-      // attempt to parse body for nicer log when stringified
-      const parsed = typeof body === "string" ? body : JSON.stringify(body);
-      console.log(`[response ${nowForLog()}] ${req.method} ${req.originalUrl} -> ${res.statusCode}\n${parsed}`);
-    } catch (err) {
-      console.log(`[response ${nowForLog()}] (unable to format body)`);
-    }
-    return oldSend.call(this, body);
-  };
-  next();
-}
-
-/* ---------------------------
-   Command Handlers (modular)
-   --------------------------- */
-
-/**
- * Handler: Registration (cmd: "reg")
- * Device sends its info (serial number, model, capacities...)
- * We store device registration data and send success + cloudtime + nosenduser:true
- */
-async function handleReg(reqBody) {
-  // expected payload example (device dependent):
-  // { cmd: "reg", SN: "ABCD1234", Model: "Aiface X100", Capacities: {...}, ... }
-  const required = ["SN"];
-  const missing = requireFields(reqBody, required);
-  if (missing.length) {
-    return { status: 400, body: { error: `Missing required fields: ${missing.join(", ")}` } };
-  }
-
-  const devices = await readJsonSafe(DEVICES_FILE, []);
-  const existingIndex = devices.findIndex((d) => d.SN === reqBody.SN);
-
-  const record = {
-    SN: reqBody.SN,
-    model: reqBody.Model || reqBody.model || null,
-    capacities: reqBody.Capacities || reqBody.capacities || null,
-    ip: reqBody.ip || reqBody.IP || null,
-    raw: reqBody,
-    registeredAt: getCloudTime().iso,
-  };
-
-  if (existingIndex >= 0) {
-    // update
-    devices[existingIndex] = { ...devices[existingIndex], ...record };
-  } else {
-    devices.push(record);
-  }
-
-  await writeJsonSafe(DEVICES_FILE, devices);
-
-  // Response per spec: include nosenduser: true
-  const { iso } = getCloudTime();
-  return {
-    status: 200,
-    body: {
-      ret: "reg",
-      result: true,
-      cloudtime: iso,
-      nosenduser: true,
-      message: "Device registered successfully",
-    },
-  };
-}
-
-/**
- * Handler: Attendance Logs (cmd: "sendlog")
- * Device posts attendance records: enrollid, timestamp, verification mode, temperature, image data
- * We'll accept either single object or array logs
- */
-async function handleSendLog(reqBody) {
-  // sample device payload:
-  // { cmd:"sendlog", logs: [ { enrollid: "1001", timestamp:"2025-09-18T10:00:00", verifyMode: "1", temp: 36.5, image: "<base64>" }, ... ] }
-  const logsContainer = reqBody.logs || reqBody.log || reqBody.data || null;
-  if (!logsContainer) {
-    return { status: 400, body: { error: "Missing logs array (logs)" } };
-  }
-
-  const logsArray = Array.isArray(logsContainer) ? logsContainer : [logsContainer];
-  if (!logsArray.length) {
-    return { status: 400, body: { error: "No log entries provided" } };
-  }
-
-  const existing = await readJsonSafe(LOGS_FILE, []);
-  const storedEntries = [];
-
-  for (const l of logsArray) {
-    // validate minimal fields
-    const required = ["enrollid", "timestamp"];
-    const missing = requireFields(l, required);
-    if (missing.length) {
-      // skip invalid entries, but continue
-      console.warn(`[handleSendLog] skipping log - missing: ${missing.join(", ")}`);
-      continue;
-    }
-
-    // simple access rule example:
-    // Deny if temperature present and >= 38.0
-    const temperature = l.temp ?? l.temperature ?? null;
-    let access = 1; // 1 = allow, 0 = deny
-    if (temperature !== null && !isNaN(parseFloat(temperature)) && parseFloat(temperature) >= 38.0) {
-      access = 0;
-    }
-
-    const entry = {
-      enrollid: String(l.enrollid),
-      timestamp: l.timestamp,
-      verifyMode: l.verifyMode ?? l.verify_mode ?? null,
-      temperature,
-      image: l.image ?? null, // store raw base64 if provided (beware size)
-      deviceSN: reqBody.SN || null,
-      serverReceivedAt: getCloudTime().iso,
-      access,
-      raw: l,
-    };
-
-    existing.push(entry);
-    storedEntries.push(entry);
-  }
-
-  await writeJsonSafe(LOGS_FILE, existing);
-
-  // response: success, log count, access (if mixed entries we'll return overall summary)
-  const { iso } = getCloudTime();
-  const allowedCount = storedEntries.filter((e) => e.access === 1).length;
-  const deniedCount = storedEntries.length - allowedCount;
-  return {
-    status: 200,
-    body: {
-      ret: "sendlog",
-      result: true,
-      cloudtime: iso,
-      log_count: storedEntries.length,
-      allowed: allowedCount,
-      denied: deniedCount,
-      message: "Logs received",
-    },
-  };
-}
-
-/**
- * Handler: Heartbeat (cmd: "checklive")
- * Device sends periodic status; respond with success & time
- */
-async function handleCheckLive(reqBody) {
-  const { iso } = getCloudTime();
-  // Optionally update device last seen
-  try {
-    const devices = await readJsonSafe(DEVICES_FILE, []);
-    if (reqBody.SN) {
-      const idx = devices.findIndex((d) => d.SN === reqBody.SN);
-      if (idx >= 0) {
-        devices[idx].lastSeen = iso;
-        devices[idx].rawLast = reqBody;
-        await writeJsonSafe(DEVICES_FILE, devices);
-      } else {
-        // not registered yet; do not error, just log
-        console.log(`[checklive] heartbeat from unknown device SN=${reqBody.SN}`);
+    
+    // Initialize files if they don't exist
+    const files = [DEVICES_FILE, LOGS_FILE, USERS_FILE];
+    for (const file of files) {
+      if (!fsSync.existsSync(file)) {
+        await fs.writeFile(file, '[]', 'utf8');
       }
     }
-  } catch (err) {
-    console.warn("[handleCheckLive] updating device lastSeen failed:", err);
+  } catch (error) {
+    console.error('Error ensuring data directory:', error);
   }
-
-  return {
-    status: 200,
-    body: {
-      ret: "checklive",
-      result: true,
-      cloudtime: iso,
-      message: "alive",
-    },
-  };
 }
 
-/**
- * Handler: User Data (cmd: "senduser")
- * New user registrations from device keypad: fingerprint, card, password, etc.
- */
-async function handleSendUser(reqBody) {
-  // sample: { cmd:"senduser", user: { id:"1001", name:"Alice", password:"1234", card:"abcd", fingerprint: "<base64>" } }
-  const userObj = reqBody.user || reqBody.users || null;
-  if (!userObj) return { status: 400, body: { error: "Missing user payload (user/users)" } };
-
-  const usersFile = await readJsonSafe(USERS_FILE, []);
-  const newUsers = Array.isArray(userObj) ? userObj : [userObj];
-  const added = [];
-
-  for (const u of newUsers) {
-    if (!u.id && !u.userid && !u.enrollid) {
-      console.warn("[handleSendUser] skipping user missing id");
-      continue;
-    }
-    const uid = u.id ?? u.userid ?? u.enrollid;
-    const existingIdx = usersFile.findIndex((x) => String(x.id) === String(uid));
-
-    const record = {
-      id: String(uid),
-      name: u.name ?? u.username ?? null,
-      password: u.password ?? null,
-      card: u.card ?? null,
-      fingerprint: u.fingerprint ?? null,
-      deviceSN: reqBody.SN || null,
-      createdAt: getCloudTime().iso,
-      raw: u,
-    };
-
-    if (existingIdx >= 0) {
-      usersFile[existingIdx] = { ...usersFile[existingIdx], ...record, updatedAt: getCloudTime().iso };
-    } else {
-      usersFile.push(record);
-    }
-    added.push(record);
-  }
-
-  await writeJsonSafe(USERS_FILE, usersFile);
-  const { iso } = getCloudTime();
-  return {
-    status: 200,
-    body: {
-      ret: "senduser",
-      result: true,
-      cloudtime: iso,
-      added: added.length,
-      message: "Users processed successfully",
-    },
-  };
-}
-
-/* ---------------------------
-   Command Router
-   --------------------------- */
-async function routeCommand(req, res) {
+async function readJsonFile(filePath) {
   try {
-    const body = req.body;
-    if (!body || typeof body !== "object") {
-      return res.status(400).send({
-        ret: null,
-        result: false,
-        cloudtime: getCloudTime().iso,
-        error: "Invalid or missing JSON body",
-      });
-    }
+    const data = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(data);
+  } catch (error) {
+    console.error(`Error reading ${filePath}:`, error);
+    return [];
+  }
+}
 
-    const cmd = body.cmd;
+async function writeJsonFile(filePath, data) {
+  try {
+    await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
+  } catch (error) {
+    console.error(`Error writing ${filePath}:`, error);
+  }
+}
+
+// Command handlers
+async function handleRegistration(body) {
+  console.log('Handling device registration...');
+  
+  const devices = await readJsonFile(DEVICES_FILE);
+  const deviceData = {
+    sn: body.sn,
+    cpusn: body.cpusn,
+    devinfo: body.devinfo,
+    registeredAt: getCurrentTime(),
+    lastSeen: getCurrentTime()
+  };
+  
+  // Update or add device
+  const existingIndex = devices.findIndex(device => device.sn === body.sn);
+  if (existingIndex >= 0) {
+    devices[existingIndex] = { ...devices[existingIndex], ...deviceData };
+  } else {
+    devices.push(deviceData);
+  }
+  
+  await writeJsonFile(DEVICES_FILE, devices);
+  
+  return {
+    ret: "reg",
+    result: true,
+    cloudtime: getCurrentTime(),
+    nosenduser: true
+  };
+}
+
+async function handleSendLog(body) {
+  console.log('Handling attendance logs...');
+  
+  const logs = await readJsonFile(LOGS_FILE);
+  const records = body.record || [];
+  
+  // Process each log record
+  for (const record of records) {
+    const logEntry = {
+      sn: body.sn,
+      enrollid: record.enrollid,
+      time: record.time,
+      mode: record.mode,
+      inout: record.inout,
+      event: record.event,
+      temp: record.temp,
+      verifymode: record.verifymode,
+      image: record.image,
+      receivedAt: getCurrentTime()
+    };
+    
+    logs.push(logEntry);
+  }
+  
+  await writeJsonFile(LOGS_FILE, logs);
+  
+  return {
+    ret: "sendlog",
+    result: true,
+    count: body.count || records.length,
+    logindex: body.logindex || 0,
+    cloudtime: getCurrentTime(),
+    access: 1, // 1 = allow access, 0 = deny
+    message: "Logs received successfully"
+  };
+}
+
+async function handleCheckLive(body) {
+  console.log('Handling heartbeat...');
+  
+  // Update device last seen time
+  if (body.sn) {
+    const devices = await readJsonFile(DEVICES_FILE);
+    const deviceIndex = devices.findIndex(device => device.sn === body.sn);
+    
+    if (deviceIndex >= 0) {
+      devices[deviceIndex].lastSeen = getCurrentTime();
+      devices[deviceIndex].lastHeartbeat = body.time || getCurrentTime();
+      await writeJsonFile(DEVICES_FILE, devices);
+    }
+  }
+  
+  return {
+    ret: "checklive",
+    result: true,
+    cloudtime: getCurrentTime()
+  };
+}
+
+async function handleSendUser(body) {
+  console.log('Handling user data...');
+  
+  const users = await readJsonFile(USERS_FILE);
+  
+  const userData = {
+    sn: body.sn,
+    enrollid: body.enrollid,
+    name: body.name,
+    backupnum: body.backupnum,
+    admin: body.admin,
+    record: body.record,
+    receivedAt: getCurrentTime()
+  };
+  
+  // Update or add user
+  const existingIndex = users.findIndex(user => 
+    user.enrollid === body.enrollid && user.backupnum === body.backupnum
+  );
+  
+  if (existingIndex >= 0) {
+    users[existingIndex] = { ...users[existingIndex], ...userData };
+  } else {
+    users.push(userData);
+  }
+  
+  await writeJsonFile(USERS_FILE, users);
+  
+  return {
+    ret: "senduser",
+    result: true,
+    cloudtime: getCurrentTime()
+  };
+}
+
+async function handleSendQRCode(body) {
+  console.log('Handling QR code verification...');
+  
+  // Simple QR code validation - you can customize this logic
+  const qrCode = body.record;
+  
+  // Example: Allow access for specific QR codes
+  const validCodes = ['123456', 'admin123', 'user456'];
+  const isValid = validCodes.includes(qrCode);
+  
+  return {
+    ret: "sendqrcode",
+    sn: body.sn,
+    result: true,
+    access: isValid ? 1 : 0,
+    enrollid: isValid ? 10 : 0,
+    username: isValid ? "QR User" : "Unknown",
+    message: isValid ? "Access granted" : "Access denied",
+    voice: isValid ? "Welcome" : "Access denied"
+  };
+}
+
+// Main API endpoint
+app.post('/api', async (req, res) => {
+  try {
+    const { cmd } = req.body;
+    
     if (!cmd) {
-      return res.status(400).send({
+      return res.status(400).json({
         ret: null,
         result: false,
-        cloudtime: getCloudTime().iso,
-        error: "Missing 'cmd' property",
+        cloudtime: getCurrentTime(),
+        error: "Missing cmd parameter"
       });
     }
-
-    // Normalise cmd to string
-    const cmdStr = String(cmd).trim().toLowerCase();
-
-    // Each handler returns object: { status, body } or throws
-    let handlerResult;
-    switch (cmdStr) {
-      case "reg":
-        handlerResult = await handleReg(body);
+    
+    let response;
+    
+    switch (cmd.toLowerCase()) {
+      case 'reg':
+        response = await handleRegistration(req.body);
         break;
-      case "sendlog":
-        handlerResult = await handleSendLog(body);
+        
+      case 'sendlog':
+        response = await handleSendLog(req.body);
         break;
-      case "checklive":
-        handlerResult = await handleCheckLive(body);
+        
+      case 'checklive':
+        response = await handleCheckLive(req.body);
         break;
-      case "senduser":
-        handlerResult = await handleSendUser(body);
+        
+      case 'senduser':
+        response = await handleSendUser(req.body);
         break;
+        
+      case 'sendqrcode':
+        response = await handleSendQRCode(req.body);
+        break;
+        
       default:
-        return res.status(400).send({
-          ret: cmdStr,
+        return res.status(400).json({
+          ret: cmd,
           result: false,
-          cloudtime: getCloudTime().iso,
-          error: `Unknown cmd: ${cmdStr}`,
+          cloudtime: getCurrentTime(),
+          error: `Unknown command: ${cmd}`
         });
     }
-
-    // handlerResult.body is the response body
-    return res.status(handlerResult.status).json(handlerResult.body);
-  } catch (err) {
-    console.error("[routeCommand] Unhandled error:", err);
-    return res.status(500).json({
+    
+    res.json(response);
+    
+  } catch (error) {
+    console.error('API Error:', error);
+    res.status(500).json({
       ret: null,
       result: false,
-      cloudtime: getCloudTime().iso,
-      error: "Internal server error",
+      cloudtime: getCurrentTime(),
+      error: "Internal server error"
     });
   }
-}
-
-/* ---------------------------
-   Server Setup & Middleware
-   --------------------------- */
-
-async function startServer() {
-  await ensureDataFiles();
-
-  const app = express();
-
-  // Basic security headers
-  app.use(helmet());
-
-  // Allow CORS from anywhere by default (adjust in production)
-  app.use(cors());
-
-  // JSON parser
-  app.use(express.json({ limit: "10mb" })); // increase if necessary for images
-
-  // Request logging (morgan)
-  app.use(
-    morgan(function (tokens, req, res) {
-      return [
-        `[req ${nowForLog()}]`,
-        tokens.method(req, res),
-        tokens.url(req, res),
-        tokens.status(req, res),
-        tokens["response-time"](req, res) + "ms",
-        "-",
-        tokens.res(req, res, "content-length"),
-      ].join(" ");
-    })
-  );
-
-  // Response logger wrapper
-  app.use(responseLoggerMiddleware);
-
-  // single endpoint
-  app.post("/api", routeCommand);
-
-  // health check
-  app.get("/health", (req, res) =>
-    res.json({ status: "ok", cloudtime: getCloudTime().iso })
-  );
-
-  // 404
-  app.use((req, res) => {
-    res.status(404).json({ ret: null, result: false, cloudtime: getCloudTime().iso, error: "Not found" });
-  });
-
-  // global error handler
-  app.use((err, req, res, next) => {
-    console.error("[global error handler]", err);
-    res.status(500).json({ ret: null, result: false, cloudtime: getCloudTime().iso, error: "Server error" });
-  });
-
-  // HTTPS attempt
-  const keyPath = path.join(CERT_DIR, "server.key");
-  const certPath = path.join(CERT_DIR, "server.crt");
-
-  let server;
-  if (fsSync.existsSync(keyPath) && fsSync.existsSync(certPath)) {
-    console.log(`[startup] TLS certs found in ${CERT_DIR}, starting HTTPS server on port ${PORT}`);
-    const key = fsSync.readFileSync(keyPath);
-    const cert = fsSync.readFileSync(certPath);
-    server = https.createServer({ key, cert }, app).listen(PORT, () => {
-      console.log(`[startup ${nowForLog()}] HTTPS server listening on port ${PORT}`);
-    });
-  } else {
-    // Fallback to HTTP but give clear instructions for generating certs
-    console.warn(`[startup] TLS certs not found in ${CERT_DIR}. Starting HTTP server on port ${PORT}.`);
-    console.warn(`[startup] To enable HTTPS, place 'server.key' and 'server.crt' (PEM) in ${CERT_DIR}.`);
-    console.warn(`[startup] Example self-signed (for testing only):`);
-    console.warn(`  mkdir -p ${CERT_DIR}`);
-    console.warn(`  openssl req -x509 -newkey rsa:4096 -nodes -keyout ${CERT_DIR}/server.key -out ${CERT_DIR}/server.crt -days 365 -subj "/CN=localhost"`);
-    server = http.createServer(app).listen(PORT, () => {
-      console.log(`[startup ${nowForLog()}] HTTP server listening on port ${PORT}`);
-    });
-  }
-
-  // graceful shutdown
-  const shutdown = (signal) => {
-    return async () => {
-      console.log(`[shutdown ${nowForLog()}] Received ${signal}. Closing server...`);
-      server.close(() => {
-        console.log(`[shutdown ${nowForLog()}] Server closed. Exiting process.`);
-        process.exit(0);
-      });
-      // if still not closed in 5s, force exit
-      setTimeout(() => {
-        console.warn("[shutdown] Forcing exit.");
-        process.exit(1);
-      }, 5000).unref();
-    };
-  };
-
-  process.on("SIGINT", shutdown("SIGINT"));
-  process.on("SIGTERM", shutdown("SIGTERM"));
-  process.on("uncaughtException", (err) => {
-    console.error("[uncaughtException]", err);
-  });
-  process.on("unhandledRejection", (reason) => {
-    console.error("[unhandledRejection]", reason);
-  });
-}
-
-/* ---------------------------
-   Launch
-   --------------------------- */
-startServer().catch((err) => {
-  console.error("[startup] Failed to start server:", err);
-  process.exit(1);
 });
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    timestamp: getCurrentTime(),
+    uptime: process.uptime()
+  });
+});
+
+// Get stored data endpoints (for monitoring)
+app.get('/devices', async (req, res) => {
+  try {
+    const devices = await readJsonFile(DEVICES_FILE);
+    res.json(devices);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to read devices' });
+  }
+});
+
+app.get('/logs', async (req, res) => {
+  try {
+    const logs = await readJsonFile(LOGS_FILE);
+    // Return latest 100 logs to avoid large responses
+    const recentLogs = logs.slice(-100);
+    res.json(recentLogs);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to read logs' });
+  }
+});
+
+app.get('/users', async (req, res) => {
+  try {
+    const users = await readJsonFile(USERS_FILE);
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to read users' });
+  }
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Aiface Attendance Server',
+    version: '1.0.0',
+    endpoints: {
+      'POST /api': 'Main device communication endpoint',
+      'GET /health': 'Health check',
+      'GET /devices': 'View registered devices',
+      'GET /logs': 'View attendance logs',
+      'GET /users': 'View user data'
+    }
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Endpoint not found',
+    timestamp: getCurrentTime()
+  });
+});
+
+// Error handler
+app.use((error, req, res, next) => {
+  console.error('Server Error:', error);
+  res.status(500).json({
+    error: 'Internal server error',
+    timestamp: getCurrentTime()
+  });
+});
+
+// Initialize and start server
+async function startServer() {
+  await ensureDataDirectory();
+  
+  app.listen(PORT, () => {
+    console.log(`\n=== Aiface Attendance Server ===`);
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Time: ${getCurrentTime()}`);
+    console.log(`\nEndpoints:`);
+    console.log(`- POST /api (main device endpoint)`);
+    console.log(`- GET /health`);
+    console.log(`- GET /devices`);
+    console.log(`- GET /logs`);
+    console.log(`- GET /users`);
+    console.log(`\nReady to receive data from Aiface devices!\n`);
+  });
+}
+
+startServer().catch(console.error);
