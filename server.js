@@ -200,7 +200,7 @@ async function handleSendUser(body) {
     if (existingIndex >= 0) {
         users[existingIndex] = { ...users[existingIndex], ...userData };
     } else {
-        users.push(userData);
+        users.push(body);
     }
 
     await writeJsonFile(USERS_FILE, users);
