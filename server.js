@@ -234,7 +234,7 @@ async function handleSendQRCode(body) {
 }
 
 // Main API endpoint
-app.post('/api', async (req, res) => {
+app.post('/pub/api', async (req, res) => {
   try {
     const { cmd } = req.body;
     
