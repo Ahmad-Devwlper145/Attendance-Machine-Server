@@ -7,16 +7,11 @@
  * Deploy on Render.com or any Node.js hosting platform
  */
 
-const express =require("express");
-const fs =require("fs/promises");
-const fsSync =require("fs");
-const path =require("path");
-const cors =require("cors");
-const { fileURLToPath } =require('url');
-
-// ES6 module compatibility
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const express = require('express');
+const fs = require('fs').promises;
+const fsSync = require('fs');
+const path = require('path');
+const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
