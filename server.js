@@ -256,6 +256,7 @@ app.post('/pub/api', async (req, res) => {
                 break;
 
             case 'sendlog':
+                console.log(req.body)
                 response = await handleSendLog(req.body);
                 break;
 
